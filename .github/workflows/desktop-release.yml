@@ -1,0 +1,154 @@
+name: Desktop-Release
+# Baut die Windows-App aus dem privaten Quell-Repo tscherny86/cyberthrone (Zweig main) und veröffentlicht sie
+# hier als Release vX.Y.Z. Dort holt die Update-Prüfung der installierten App (electron-updater) neue Versionen ab.
+#
+# Sicherheit (seit 2.2.3, vorher lief das im privaten Repo mit einem Repo-Secret, das jeder Zweig nutzen konnte):
+# - Läuft nur per Hand (Actions → Desktop-Release → Run workflow), nie von selbst.
+# - Der Job nutzt die Umgebung "release": Sie lässt nur den Zweig main zu und wartet auf Alex' Freigabe
+#   ("Review deployments" → "Approve and deploy"). Erst danach gibt GitHub den Schlüssel SOURCE_TOKEN heraus.
+# - SOURCE_TOKEN darf das Quell-Repo nur lesen. Veröffentlicht wird mit dem GITHUB_TOKEN dieses Laufs,
+#   und zwar nur in den eigenen Python-Schritten, nie beim npm/electron-builder-Schritt.
+# - Claude-Threads starten diesen Workflow nie; die Claude-App hat auf dieses Repo keinen Zugriff.
+on:
+  workflow_dispatch:
+    inputs:
+      nur_bauen:
+        description: "Nur bauen und als Datei zum Herunterladen ablegen, nichts veröffentlichen (Probelauf)"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+jobs:
+  windows:
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Quellcode holen (tscherny86/cyberthrone, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: tscherny86/cyberthrone
+          ref: main
+          path: src
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Version, VERSIONEN.md und Release Notes
+        id: v
+        working-directory: src
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import json, os, re, sys
+          v = json.load(open("desktop/package.json"))["version"]
+          text = open("VERSIONEN.md", encoding="utf-8").read()
+          sec = text.split("## Versionen", 1)[1]
+          if not re.search(r"^###\s+" + re.escape(v) + r"\b", sec, re.M): print(f"FEHLER: VERSIONEN.md hat keinen Eintrag für {v}"); sys.exit(1)
+          m = re.search(r"^###\s+" + re.escape(v) + r"\b.*?$(.*?)(?=^###\s+\d)", sec, re.M | re.S)
+          body = m.group(1).strip() if m else ""
+          notes = re.search(r"\*\*Release Notes\*\*(.*?)(?=^\*\*|\Z)", body, re.M | re.S)
+          out = (notes.group(1).strip() if notes else body) or f"Cyberthrone {v}"
+          open("desktop/release-notes.md", "w", encoding="utf-8").write(out + "\n\nAlle Details: VERSIONEN.md im Quell-Repo.\n")
+          open(os.environ["GITHUB_OUTPUT"], "a").write(f"version={v}\n")
+          print("Version", v); print(out)
+          PY
+      - name: Gibt es die Version schon?
+        id: neu
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+          NUR_BAUEN: ${{ inputs.nur_bauen }}
+          PYTHONUTF8: "1"
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          api = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/releases"
+          hdr = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+          r = urllib.request.Request(api + "?per_page=50", headers=hdr)
+          with urllib.request.urlopen(r) as resp: rels = json.load(resp)
+          tag = "v" + os.environ["V"]
+          rel = next((x for x in rels if x["tag_name"] == tag), None)
+          done = bool(rel and not rel["draft"] and "latest.yml" in [a["name"] for a in rel["assets"]])
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+          if done and os.environ["NUR_BAUEN"] != "true":
+              print(tag, "ist schon vollständig veröffentlicht, nichts zu tun. Für ein neues Release desktop/package.json erhöhen."); out.write("bauen=nein\n")
+          else: out.write("bauen=ja\n")
+          PY
+      - name: Abhängigkeiten
+        if: steps.neu.outputs.bauen == 'ja'
+        working-directory: src/desktop
+        run: |
+          npm ci
+          npm audit
+      - name: Bauen (ohne Schlüssel)
+        if: steps.neu.outputs.bauen == 'ja'
+        working-directory: src/desktop
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+        run: |
+          npx electron-builder --win nsis portable --publish never -c.releaseInfo.releaseNotesFile=release-notes.md
+          ls -l dist
+      - name: Probelauf ablegen
+        if: steps.neu.outputs.bauen == 'ja' && inputs.nur_bauen
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cyberthrone-windows-probe
+          path: |
+            src/desktop/dist/*.exe
+            src/desktop/dist/latest.yml
+          retention-days: 7
+      - name: Veröffentlichen (Entwurf anlegen, hochladen, freigeben)
+        if: steps.neu.outputs.bauen == 'ja' && !inputs.nur_bauen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+          COMMIT: ${{ steps.v.outputs.commit }}
+          PYTHONUTF8: "1"
+        run: |
+          python - <<'PY'
+          import json, os, shutil, sys, urllib.parse, urllib.request
+          repo = os.environ["GITHUB_REPOSITORY"]
+          api = f"https://api.github.com/repos/{repo}/releases"
+          hdr = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+          def req(url, data=None, method="GET", raw=None, ctype=None):
+              h = dict(hdr)
+              if ctype: h["Content-Type"] = ctype
+              body = raw if raw is not None else (json.dumps(data).encode() if data else None)
+              r = urllib.request.Request(url, data=body, headers=h, method=method)
+              with urllib.request.urlopen(r) as resp:
+                  t = resp.read(); return json.loads(t) if t else None
+          v = os.environ["V"]; tag = "v" + v; dist = os.path.join("src", "desktop", "dist")
+          files = [f"Cyberthrone-Setup-{v}.exe", f"Cyberthrone-Setup-{v}.exe.blockmap", "Cyberthrone-portable.exe", "latest.yml"]
+          miss = [f for f in files if not os.path.exists(os.path.join(dist, f))]
+          if miss: print("FEHLER: electron-builder hat nicht erzeugt:", miss); sys.exit(1)
+          # Fester Name, damit .../releases/latest/download/Cyberthrone-Setup.exe immer das neueste Setup liefert.
+          shutil.copyfile(os.path.join(dist, files[0]), os.path.join(dist, "Cyberthrone-Setup.exe")); files.append("Cyberthrone-Setup.exe")
+          rel = next((r for r in req(api + "?per_page=50") if r["tag_name"] == tag), None)
+          if rel and not rel["draft"]: print(tag, "ist unvollständig veröffentlicht -> wieder Entwurf"); rel = req(f"{api}/{rel['id']}", {"draft": True}, "PATCH")
+          if not rel: rel = req(api, {"tag_name": tag, "target_commitish": "main", "name": "Cyberthrone " + v, "draft": True}, "POST"); print("Entwurf", tag, "angelegt")
+          have = {a["name"]: a["id"] for a in rel["assets"]}
+          for f in files:
+              if f in have: req(f"{api}/assets/{have[f]}", method="DELETE")
+              data = open(os.path.join(dist, f), "rb").read()
+              url = f"https://uploads.github.com/repos/{repo}/releases/{rel['id']}/assets?name=" + urllib.parse.quote(f)
+              req(url, method="POST", raw=data, ctype="application/octet-stream")
+              print("hochgeladen:", f, len(data), "Bytes")
+          notes = open(os.path.join("src", "desktop", "release-notes.md"), encoding="utf-8").read()
+          body = notes + f"\nGebaut aus tscherny86/cyberthrone, Commit {os.environ['COMMIT'][:12]}.\n"
+          out = req(f"{api}/{rel['id']}", {"draft": False, "prerelease": False, "make_latest": "true", "tag_name": tag, "target_commitish": "main", "name": "Cyberthrone " + v, "body": body}, "PATCH")
+          print("Veröffentlicht:", out["html_url"])
+          PY
